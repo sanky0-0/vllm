@@ -132,6 +132,14 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    from vllm.platforms import current_platform
+
+    # This opaque op has a functional (non-mutating, non-aliasing) schema.
+    # Its runtime body is not Dynamo tracing, so is_compiling() cannot guard
+    # XpuCommunicator's eager in-place optimization here. Clone at the op
+    # boundary; ordinary eager collectives still retain that optimization.
+    if current_platform.is_xpu():
+        tensor = tensor.clone()
     return group._all_reduce_out_place(tensor)
 
 
@@ -504,6 +512,7 @@ class GroupCoordinator:
         self.use_custom_op_call = (
             current_platform.is_tpu() or current_platform.use_custom_op_collectives()
         )
+        self.bypass_custom_all_reduce_in_eager = current_platform.is_xpu()
 
         self.use_cpu_custom_send_recv = (
             current_platform.is_cpu()
@@ -657,7 +666,12 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if self.use_custom_op_call:
+        use_custom_op = self.use_custom_op_call and not (
+            self.bypass_custom_all_reduce_in_eager
+            and not torch.compiler.is_compiling()
+            and not torch.xpu.is_current_stream_capturing()
+        )
+        if use_custom_op:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
             return self._all_reduce_out_place(input_)

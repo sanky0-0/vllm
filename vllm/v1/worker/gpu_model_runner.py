@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -248,6 +249,39 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+_QWEN3_NEXT_PLAIN_MROPE = "_qwen3_next_plain_mrope"
+
+
+def _is_qwen3_next_plain_mrope_eligible(
+    *,
+    uses_mrope: bool,
+    cudagraph_mode: CUDAGraphMode,
+    num_tokens_unpadded: int,
+    num_tokens_padded: int,
+    is_speculative: bool,
+    allow_speculative: bool,
+    mrope_positions: np.ndarray | None,
+) -> bool:
+    """Whether the eager QKV path can treat this batch's MRoPE as plain RoPE."""
+    if (
+        not uses_mrope
+        or cudagraph_mode != CUDAGraphMode.NONE
+        or num_tokens_unpadded != num_tokens_padded
+        or not 1 <= num_tokens_unpadded <= 64
+        or (is_speculative and not allow_speculative)
+        or mrope_positions is None
+        or mrope_positions.ndim != 2
+        or mrope_positions.shape[0] != 3
+        or mrope_positions.shape[1] < num_tokens_unpadded
+    ):
+        return False
+
+    positions = mrope_positions[:, :num_tokens_unpadded]
+    return np.array_equal(positions[0], positions[1]) and np.array_equal(
+        positions[0], positions[2]
+    )
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -1176,6 +1210,12 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # In synchronous scheduling mode, ensure previous iteration's D2H copy
+        # into input_batch is complete before requests are removed, condensed,
+        # or reordered.
+        if not self.use_async_scheduling and self.num_accepted_tokens_event is not None:
+            self.num_accepted_tokens_event.synchronize()
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1567,12 +1607,20 @@ class GPUModelRunner(
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
+            # Under async scheduling, the next step's _update_states() mutates
+            # input_batch row order (condense/swap) while this D2H copy is
+            # in flight on the CUDA stream. Target the runner-owned CPU buffer
+            # so input_batch is never an asynchronous DMA destination.
+            # Under sync scheduling, the copy is already complete before row
+            # moves, so input_batch owns the counts directly.
             mamba_utils.postprocess_mamba_align_gpu(
                 bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
+                    self.num_accepted_tokens.cpu
+                    if self.use_async_scheduling
+                    else self.input_batch.num_accepted_tokens_cpu_tensor
                 ),
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
@@ -1583,7 +1631,12 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+            dst_cpu = (
+                self.num_accepted_tokens.cpu
+                if self.use_async_scheduling
+                else self.input_batch.num_accepted_tokens_cpu_tensor
+            )
+            dst_cpu[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
             assert self.num_accepted_tokens_event is not None
@@ -1934,6 +1987,39 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _sync_num_accepted_tokens(
+        self, num_reqs: int, prev_req_id_to_index: dict[str, int] | None
+    ) -> None:
+        """Synchronize and remap accepted token counts into input_batch.
+
+        In async scheduling mode, remaps counts from runner.num_accepted_tokens.np
+        through prev_positions to account for row shifts from InputBatch.condense().
+        In sync mode, InputBatch owns counts and condense()/reorder moves them
+        during _update_states(), so we read directly from input_batch.
+        """
+        if self.use_async_scheduling:
+            if prev_req_id_to_index:
+                # Remap the previous-iteration runner snapshot through prev_positions.
+                prev_idx = self.prev_positions.np[:num_reqs]
+                new_mask = prev_idx < 0
+                self.num_accepted_tokens.np[:num_reqs] = self.num_accepted_tokens.np[
+                    np.where(new_mask, 0, prev_idx)
+                ]
+                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                    self.num_accepted_tokens.np[:num_reqs]
+                )
+            else:
+                # Initial step or all-chunked-prefill step
+                self.num_accepted_tokens.np[:num_reqs].fill(1)
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs].fill(1)
+        else:
+            # Non-async mode: InputBatch owns counts and condense()/reorder
+            # moved them during _update_states(). Read directly from input_batch.
+            self.num_accepted_tokens.np[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2091,24 +2177,7 @@ class GPUModelRunner(
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
-            # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
-                prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
-                )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
-                    self.num_accepted_tokens.np[:num_reqs]
-                )
-            else:
-                # Non-async mode: use values directly
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
+            self._sync_num_accepted_tokens(num_reqs, prev_req_id_to_index)
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
         else:
@@ -4360,6 +4429,18 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+        qwen3_next_plain_mrope = _is_qwen3_next_plain_mrope_eligible(
+            uses_mrope=self.uses_mrope,
+            cudagraph_mode=cudagraph_mode,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            is_speculative=self.speculative_config is not None,
+            allow_speculative=(
+                self.speculative_config is not None
+                and self.speculative_config.use_qwen_mtp_or_dflash()
+            ),
+            mrope_positions=(self.mrope_positions.np if self.uses_mrope else None),
+        )
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4391,6 +4472,9 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            get_forward_context().additional_kwargs[_QWEN3_NEXT_PLAIN_MROPE] = (
+                qwen3_next_plain_mrope
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
